@@ -5,6 +5,7 @@ A Model Context Protocol server that provides access to PostgreSQL databases.
 """
 
 import sys
+import re
 import json
 import asyncio
 import logging
@@ -23,6 +24,54 @@ from mcp import types
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# Functions that read data OUTSIDE the database (local files, large objects, other
+# databases). A READ ONLY transaction stops writes but NOT these reads, so a SELECT that
+# calls one of them can exfiltrate arbitrary server-side files even though it "starts with
+# SELECT". They are rejected regardless of case or surrounding whitespace.
+_FORBIDDEN_FUNCTIONS = (
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_ls_tmpdir",
+    "pg_ls_logdir",
+    "pg_ls_waldir",
+    "pg_ls_archive_statusdir",
+    "pg_stat_file",
+    "pg_current_logfile",
+    "lo_import",
+    "lo_export",
+    "lo_get",
+    "lo_put",
+    "lo_from_bytea",
+    "dblink",
+    "dblink_connect",
+    "dblink_exec",
+)
+_FORBIDDEN_RE = re.compile(r"\b(" + "|".join(_FORBIDDEN_FUNCTIONS) + r")\b", re.IGNORECASE)
+_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def validate_readonly_query(sql_query: str) -> None:
+    """Validate that ``sql_query`` is a safe, read-only SELECT.
+
+    Raises ``ValueError`` if the statement is not a SELECT or references a function that can
+    read data outside the database. "Starts with SELECT" plus a READ ONLY transaction is NOT
+    a security boundary against reads: built-in functions like ``pg_read_file`` return
+    arbitrary file contents from inside a perfectly valid read-only SELECT.
+    """
+    # Strip comments first so a denied function can't be hidden inside /* ... */ or -- ...
+    cleaned = _COMMENT_RE.sub(" ", sql_query).strip()
+    if not cleaned.upper().startswith("SELECT"):
+        raise ValueError("Only SELECT queries are allowed for security reasons")
+    match = _FORBIDDEN_RE.search(cleaned)
+    if match:
+        raise ValueError(
+            f"Query rejected for security reasons: '{match.group(1)}' can read data outside "
+            "the database (files, large objects, or other databases) and is not permitted, "
+            "even inside a read-only transaction."
+        )
 
 
 class PostgreSQLMCPServer:
@@ -196,11 +245,10 @@ class PostgreSQLMCPServer:
             if not sql_query:
                 raise ValueError("SQL query is required")
             
-            # Basic security check - only allow SELECT statements
-            sql_query_upper = sql_query.strip().upper()
-            if not sql_query_upper.startswith("SELECT"):
-                raise ValueError("Only SELECT queries are allowed for security reasons")
-            
+            # Security check: only allow read-only SELECT statements, and reject built-in
+            # functions that read outside the database (a read-only txn does not stop reads).
+            validate_readonly_query(sql_query)
+
             conn = None
             try:
                 conn = self.connection_pool.getconn()
